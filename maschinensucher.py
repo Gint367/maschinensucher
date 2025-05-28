@@ -6,6 +6,7 @@ from encodings.punycode import T
 import json
 import logging
 import os
+import random
 import re
 import time
 from datetime import datetime
@@ -27,6 +28,69 @@ from crawl4ai import (
 )
 from crawl4ai.content_scraping_strategy import LXMLWebScrapingStrategy  # Add this import
 browser_config = BrowserConfig(headless=True, verbose=True, text_mode=True)
+
+def is_valid_phone_number(phone_str: str) -> bool:
+    """
+    Check if a phone string contains a valid phone number.
+    Returns False if it contains error messages or is not a proper phone number.
+    
+    Args:
+        phone_str (str): Phone number string to validate
+        
+    Returns:
+        bool: True if valid phone number, False otherwise
+    """
+    if not phone_str or not phone_str.strip():
+        return False
+    
+    phone_str = phone_str.strip()
+    
+    # Check for German error messages
+    error_messages = [
+        "Die Telefonnummer kann aktuell nicht abgerufen werden",
+        "bitte versuchen Sie es später erneut",
+        "Telefonnummer nicht verfügbar",
+        "nicht erreichbar",
+        "temporarily unavailable",
+        "not available"
+    ]
+    
+    # If any error message is found, it's not a valid phone number
+    for error_msg in error_messages:
+        if error_msg.lower() in phone_str.lower():
+            return False
+    
+    # Basic phone number pattern validation (German and international formats)
+    # Allow numbers with +, spaces, hyphens, parentheses, and typical separators
+    phone_pattern = r'^[\+]?[\d\s\-\(\)\/\.]{7,20}$'
+    
+    # Remove common separators for pattern matching
+    cleaned_phone = re.sub(r'[\s\-\(\)\/\.]', '', phone_str)
+    
+    # Must contain at least 7 digits and not be all zeros
+    if len(cleaned_phone) < 7 or cleaned_phone.replace('+', '').replace('0', '') == '':
+        return False
+    
+    return bool(re.match(phone_pattern, phone_str))
+
+async def exponential_backoff_delay(attempt: int, base_delay: float = 1.0, max_delay: float = 30.0) -> None:
+    """
+    Apply exponential backoff delay with jitter.
+    
+    Args:
+        attempt (int): Current attempt number (0-based)
+        base_delay (float): Base delay in seconds
+        max_delay (float): Maximum delay in seconds
+    """
+    # Calculate exponential delay: base_delay * 2^attempt
+    delay = min(base_delay * (2 ** attempt), max_delay)
+    
+    # Add jitter (±25% randomness) to prevent thundering herd
+    jitter = delay * 0.25 * (2 * random.random() - 1)
+    final_delay = max(0, delay + jitter)
+    
+    logging.debug(f"Applying exponential backoff: attempt {attempt + 1}, delay {final_delay:.2f}s")
+    await asyncio.sleep(final_delay)
 
 def load_schemas_from_json(
     schema_file_path: str = os.path.join("schemas", "dealer_schema.json"),
@@ -329,15 +393,25 @@ async def grab_dealer_info_parallel( # TODO: NOT WORKING YET, use se sequential 
     return df
 
 async def grab_dealer_info_sequential(
-    dealer_links 
+    dealer_links,
+    delay_between_requests: float = 2.0,
+    max_retries: int = 3,
+    retry_base_delay: float = 2.0,
+    retry_max_delay: float = 30.0
 ) -> pd.DataFrame:
     """
     Grab detailed dealer information from maschinensucher.de using provided dealer links.
     Supports both single link (str) and multiple links (List[str]).
     Extracts contact details including phone, fax, and contact person.
     
+    Features robust retry logic with exponential backoff for failed phone number extractions.
+    
     Args:
         dealer_links: Single dealer link (str) or list of dealer links (List[str])
+        delay_between_requests (float): Delay in seconds between each dealer request (default: 2.0)
+        max_retries (int): Maximum number of retry attempts for failed extractions (default: 3)
+        retry_base_delay (float): Base delay for exponential backoff in seconds (default: 2.0)
+        retry_max_delay (float): Maximum delay for exponential backoff in seconds (default: 30.0)
         
     Returns:
         pd.DataFrame: DataFrame with columns: contact_person, phone_number, fax_number, id
@@ -393,9 +467,8 @@ async def grab_dealer_info_sequential(
     
     # Load schemas once outside the loop
     schemas = load_schemas_from_json(os.path.join("schemas", "dealer_info.json"))
-    
     # Process each dealer link individually with its own crawler instance
-    for dealer_link in dealer_links:
+    for i, dealer_link in enumerate(dealer_links):
         dealer_id = extract_dealer_id_from_link(dealer_link)
         
         # Convert relative link to absolute URL if needed
@@ -404,81 +477,138 @@ async def grab_dealer_info_sequential(
         else:
             url = dealer_link
         
-        logging.debug(f"Processing dealer {dealer_id}: {url}")
+        logging.info(f"Processing dealer {i+1}/{len(dealer_links)} - ID: {dealer_id}")
+        logging.debug(f"URL: {url}")
         
-        # Create a fresh crawler instance for each dealer
-        special_browser_config = BrowserConfig(
-            headless=True, 
-            verbose=False,
-            use_persistent_context=True,
-            user_data_dir=os.path.join("browser_data", f"maschinensucher_dealer_{dealer_id}")  # Unique directory per dealer
-        )
+        # Apply delay between requests (except for the first request)
+        if i > 0:
+            logging.debug(f"Applying delay of {delay_between_requests}s between requests")
+            await asyncio.sleep(delay_between_requests)
         
-        async with AsyncWebCrawler(config=special_browser_config) as crawler:
-            # Configure crawler
-            crawl_config = CrawlerRunConfig(
-                cache_mode=CacheMode.BYPASS,
-                js_code=js_code_to_show_phones,
-                wait_for='css:#link-phone',
-                delay_before_return_html=2.0,
-                keep_attrs=["id", "class"],
-                keep_data_attributes=True,
-            )
-            
-            # Crawl the individual page
-            result = await crawler.arun(url, config=crawl_config)
-            
-            if result.success:
-                # Use JsonCssExtractionStrategy to extract data
-                for schema in schemas:
-                    schema_name = schema.get("name", "Unknown Schema")
-                    logging.debug(f"Processing schema: {schema_name} for dealer {dealer_id}")
+        # Retry logic for each dealer
+        dealer_success = False
+        for attempt in range(max_retries + 1):  # +1 for initial attempt
+            try:
+                # Create a fresh crawler instance for each attempt
+                special_browser_config = BrowserConfig(
+                    headless=True, 
+                    verbose=False,
+                    use_persistent_context=True,
+                    user_data_dir=os.path.join("browser_data", f"maschinensucher_dealer_{dealer_id}")
+                )
+                
+                async with AsyncWebCrawler(config=special_browser_config) as crawler:
+                    # Configure crawler
+                    crawl_config = CrawlerRunConfig(
+                        cache_mode=CacheMode.BYPASS,
+                        js_code=js_code_to_show_phones,
+                        wait_for='css:#link-phone',
+                        delay_before_return_html=2.0,
+                        keep_attrs=["id", "class"],
+                        keep_data_attributes=True,
+                    )
                     
-                    # Ensure result.html is not None before passing to extraction
-                    current_html_content = result.html if result.html is not None else ""
-                    if not current_html_content:
-                        logging.warning(f"HTML content is empty for URL: {url}. Skipping schema extraction for {schema_name}.")
-                        continue
+                    # Crawl the individual page
+                    result = await crawler.arun(url, config=crawl_config)
                     
-                    try:
-                        extracted_data = JsonCssExtractionStrategy(
-                            schema=schema,
-                        ).run(url=url, sections=[current_html_content])
+                    if result.success:
+                        extracted_valid_data = False
+                        temp_contact_details = []
                         
-                        logging.debug(f"Extracted data from {schema_name} schema (dealer {dealer_id}): {extracted_data}")
-                        
-                        if isinstance(extracted_data, list):
-                            for item in extracted_data:
-                                if isinstance(item, dict):
+                        # Use JsonCssExtractionStrategy to extract data
+                        for schema in schemas:
+                            schema_name = schema.get("name", "Unknown Schema")
+                            logging.debug(f"Processing schema: {schema_name} for dealer {dealer_id} (attempt {attempt + 1})")
+                            
+                            # Ensure result.html is not None before passing to extraction
+                            current_html_content = result.html if result.html is not None else ""
+                            if not current_html_content:
+                                logging.warning(f"HTML content is empty for URL: {url}. Skipping schema extraction for {schema_name}.")
+                                continue
+                            
+                            try:
+                                extracted_data = JsonCssExtractionStrategy(
+                                    schema=schema,
+                                ).run(url=url, sections=[current_html_content])
+                                
+                                logging.debug(f"Extracted data from {schema_name} schema (dealer {dealer_id}): {extracted_data}")
+                                
+                                if isinstance(extracted_data, list):
+                                    for item in extracted_data:
+                                        if isinstance(item, dict):
+                                            phone_number = item.get('phone', '')
+                                            contact_entry = {
+                                                'contact_person': item.get('contact_person', ''),
+                                                'phone_number': phone_number,
+                                                'fax_number': item.get('fax', ''),
+                                                'id': dealer_id
+                                            }
+                                            temp_contact_details.append(contact_entry)
+                                            
+                                            # Check if we got a valid phone number
+                                            if is_valid_phone_number(phone_number):
+                                                extracted_valid_data = True
+                                                
+                                elif isinstance(extracted_data, dict):
+                                    phone_number = extracted_data.get('phone', '')
                                     contact_entry = {
-                                        'contact_person': item.get('contact_person', ''),
-                                        'phone_number': item.get('phone', ''),
-                                        'fax_number': item.get('fax', ''),
+                                        'contact_person': extracted_data.get('contact_person', ''),
+                                        'phone_number': phone_number,
+                                        'fax_number': extracted_data.get('fax', ''),
                                         'id': dealer_id
                                     }
-                                    all_contact_details.append(contact_entry)
-                        elif isinstance(extracted_data, dict):
-                            contact_entry = {
-                                'contact_person': extracted_data.get('contact_person', ''),
-                                'phone_number': extracted_data.get('phone', ''),
-                                'fax_number': extracted_data.get('fax', ''),
-                                'id': dealer_id
-                            }
-                            all_contact_details.append(contact_entry)
-                    
-                    except Exception as e:
-                        logging.error(f"Error extracting data from schema {schema_name} for dealer {dealer_id}: {str(e)}")
-                        continue
-            else:
-                logging.error(f"Failed to extract contact details for dealer {dealer_id}: {result.error_message}")
-                # Add empty entry to maintain data consistency
-                empty_entry = {
-                    'contact_person': '',
-                    'phone_number': '',
-                    'fax_number': '',
-                    'id': dealer_id
-                }
-                all_contact_details.append(empty_entry)
+                                    temp_contact_details.append(contact_entry)
+                                    
+                                    # Check if we got a valid phone number
+                                    if is_valid_phone_number(phone_number):
+                                        extracted_valid_data = True
+                            
+                            except Exception as e:
+                                logging.error(f"Error extracting data from schema {schema_name} for dealer {dealer_id}: {str(e)}")
+                                continue
+                          # Check if we extracted valid data
+                        if extracted_valid_data:
+                            logging.info(f"Successfully extracted valid contact data for dealer {dealer_id} on attempt {attempt + 1}")
+                            # Add the extracted data to final results
+                            all_contact_details.extend(temp_contact_details)
+                            dealer_success = True
+                            break
+                        elif attempt == max_retries:
+                            # Last attempt and still no valid data - don't add invalid data
+                            logging.warning(f"No valid phone number found for dealer {dealer_id} after {max_retries + 1} attempts")
+                            dealer_success = False  # Will trigger empty entry addition later
+                            break
+                        else:
+                            # Invalid data detected, prepare for retry
+                            invalid_phones = [entry['phone_number'] for entry in temp_contact_details if entry['phone_number']]
+                            logging.warning(f"Invalid phone number(s) detected for dealer {dealer_id} on attempt {attempt + 1}: {invalid_phones}")
+                            logging.info(f"Retrying dealer {dealer_id} in {retry_base_delay * (2 ** attempt):.1f}s...")
+                            
+                            # Apply exponential backoff before retry
+                            if attempt < max_retries:
+                                await exponential_backoff_delay(attempt, retry_base_delay, retry_max_delay)
+                    else:
+                        logging.error(f"Failed to crawl dealer {dealer_id} on attempt {attempt + 1}: {result.error_message}")
+                        if attempt < max_retries:
+                            logging.info(f"Retrying dealer {dealer_id} in {retry_base_delay * (2 ** attempt):.1f}s...")
+                            await exponential_backoff_delay(attempt, retry_base_delay, retry_max_delay)
+                        
+            except Exception as e:
+                logging.error(f"Exception occurred for dealer {dealer_id} on attempt {attempt + 1}: {str(e)}")
+                if attempt < max_retries:
+                    logging.info(f"Retrying dealer {dealer_id} in {retry_base_delay * (2 ** attempt):.1f}s...")
+                    await exponential_backoff_delay(attempt, retry_base_delay, retry_max_delay)
+        
+        # If all attempts failed, add empty entry to maintain data consistency
+        if not dealer_success:
+            logging.error(f"All attempts failed for dealer {dealer_id}, adding empty entry")
+            empty_entry = {
+                'contact_person': '',
+                'phone_number': '',
+                'fax_number': '',
+                'id': dealer_id
+            }
+            all_contact_details.append(empty_entry)
     
     # Create DataFrame with consistent column structure
     df = pd.DataFrame(all_contact_details)
@@ -1277,7 +1407,6 @@ def prepare_csv(merged_df: pd.DataFrame) -> pd.DataFrame:
         prepared_df['vertrauensiegel'] = prepared_df['attributes'].fillna('').str.lower().str.contains('vertrauenssiegel')
     else:
         prepared_df['vertrauensiegel'] = False
-    
     # Log first few entries with vertrauensiegel
     if 'vertrauensiegel' in prepared_df.columns:
         vertrauensiegel_dealers = prepared_df[prepared_df['vertrauensiegel']].head(5)
@@ -1300,6 +1429,9 @@ def prepare_csv(merged_df: pd.DataFrame) -> pd.DataFrame:
         "page_number",
         "source_url",
         "dealer_id",
+        "contact_person",
+        "phone_number",
+        "fax_number",
         "main_category",
         "main_category_count"
     ]
@@ -1510,8 +1642,7 @@ async def main():
         # Get machine data using parallel crawling (regardless of --parallel flag)
         logging.info(f"Grabbing machine data for {len(valid_dealers_df)} dealers...")
         dealer_ids_list = valid_dealers_df['dealer_id'].tolist()
-        
-        # Use the first dealer's category_id for machine crawling, or use args.category
+          # Use the first dealer's category_id for machine crawling, or use args.category
         category_code = args.category if args.category else valid_dealers_df['category_id'].iloc[0] if 'category_id' in valid_dealers_df.columns else ""
         
         machines_data = await grab_dealer_machines_parallel(
@@ -1520,13 +1651,34 @@ async def main():
             num_pages=args.machine_pages
         )
         
-        logging.info(f"Retrieved machine data: {len(machines_data)} records")        # Merge dealers data with machines data on dealer_id
+        logging.info(f"Retrieved machine data: {len(machines_data)} records")
+        
+        # Get detailed dealer contact information
+        logging.info(f"Grabbing detailed contact information for {len(valid_dealers_df)} dealers...")
+        dealer_links_list = valid_dealers_df['link'].tolist()
+        contact_info_data = await grab_dealer_info_sequential(dealer_links=dealer_links_list)
+        logging.info(f"Retrieved contact information: {len(contact_info_data)} records")
+
+        # Merge dealers data with machines data on dealer_id
         if not machines_data.empty:
             merged_df = pd.merge(dealers_df, machines_data, on='dealer_id', how='left')
             logging.info(f"Merged dealers and machines data: {len(merged_df)} records")
         else:
             merged_df = dealers_df.copy()
             logging.warning("No machine data found, using dealers data only")
+        
+        # Merge with contact information data on dealer_id
+        if not contact_info_data.empty:
+            # Rename 'id' column to 'dealer_id' in contact_info_data for merging
+            contact_info_data_renamed = contact_info_data.rename(columns={'id': 'dealer_id'})
+            merged_df = pd.merge(merged_df, contact_info_data_renamed, on='dealer_id', how='left')
+            logging.info(f"Merged with contact information: {len(merged_df)} records")
+        else:
+            # Add empty contact columns if no contact data was retrieved
+            merged_df['contact_person'] = ''
+            merged_df['phone_number'] = ''
+            merged_df['fax_number'] = ''
+            logging.warning("No contact information found, added empty contact columns")
 
         # Save results to files
         if not merged_df.empty:
@@ -1547,9 +1699,7 @@ async def main():
 
             # Generate category analytics columns ONLY for CSV
             csv_df = generate_category_analytics_columns(merged_df)
-            logging.info("Added category analytics columns for CSV output")
-
-            # Prepare and save CSV with flattened category columns
+            logging.info("Added category analytics columns for CSV output")            # Prepare and save CSV with flattened category columns
             csv_filename = os.path.join(output_dir, f"dealer_results{category_suffix}_{timestamp}.csv")
             prepared_df = prepare_csv(csv_df)
             success = save_to_csv(prepared_df, csv_filename)
@@ -1569,6 +1719,16 @@ async def main():
             print(f"Total machine records found: {len(machines_data)}")
         else:
             print("No machine data found")
+        
+        # Summary of contact information data
+        if not contact_info_data.empty:
+            dealers_with_contact_info = len(merged_df[(merged_df['contact_person'] != '') | 
+                                                     (merged_df['phone_number'] != '') | 
+                                                     (merged_df['fax_number'] != '')])
+            print(f"Dealers with contact information: {dealers_with_contact_info}/{len(merged_df)}")
+            print(f"Total contact records found: {len(contact_info_data)}")
+        else:
+            print("No contact information found")
         
         if not merged_df.empty:
             print("Results saved to:")
@@ -1591,5 +1751,5 @@ if __name__ == "__main__":
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         datefmt="%H:%M:%S"
     )
-    #asyncio.run(main())
-    asyncio.run(grab_dealer_info_parallel(dealer_links=[ "/Haendler/47558/wmw-ag-leipzig", "/Haendler/49713/dynamic-power-laser-gmbh-leipzig"]))  # Run the main function asynchronously
+    asyncio.run(main())
+    #asyncio.run(grab_dealer_info_parallel(dealer_links=[ "/Haendler/47558/wmw-ag-leipzig", "/Haendler/49713/dynamic-power-laser-gmbh-leipzig"]))  # Run the main function asynchronously

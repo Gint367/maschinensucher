@@ -1,0 +1,23 @@
+[
+    {
+        "name": "Contact Details",
+        "baseSelector": "div.alert.alert-secondary",
+        "fields": [
+            {
+                "name": "contact_person",
+                "selector": "p strong",
+                "type": "text"
+            },
+            {
+                "name": "phone",
+                "selector": "#link-phone a[data-customer='phone']",
+                "type": "text"
+            },
+            {
+                "name": "fax",
+                "selector": "#link-fax a[data-customer='fax']",
+                "type": "text"
+            }
+        ]
+    }
+]

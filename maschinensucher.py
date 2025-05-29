@@ -330,12 +330,32 @@ async def grab_dealer_info_parallel( # TODO: NOT WORKING YET, use se sequential 
     logging.info(f"Successfully extracted contact details for {len(df)} dealers")
     return df
 
+"""
+Suggested delay and retry settings for different crawling strategies:
+Max Safety:
+delay_between_requests: float = 12.0,    # 5 requests/minute
+max_retries: int = 3,
+retry_base_delay: float = 15.0,
+retry_max_delay: float = 90.0
+
+OR Balanced:
+delay_between_requests: float = 6.0,     # 10 requests/minute
+max_retries: int = 3,
+retry_base_delay: float = 8.0,
+retry_max_delay: float = 45.0
+
+OR Aggressive:
+delay_between_requests: float = 4.0,     # 15 requests/minute
+max_retries: int = 2,
+retry_base_delay: float = 6.0,
+retry_max_delay: float = 30.0
+"""
 async def grab_dealer_info_sequential(
     dealer_links,
-    delay_between_requests: float = 5.0,
-    max_retries: int = 1,
-    retry_base_delay: float = 5.0,
-    retry_max_delay: float = 30.0
+    delay_between_requests: float = 8.0,
+    max_retries: int = 2,
+    retry_base_delay: float = 10.0,
+    retry_max_delay: float = 60.0
 ) -> pd.DataFrame:
     """
     Grab detailed dealer information from maschinensucher.de using provided dealer links.
@@ -477,7 +497,7 @@ async def grab_dealer_info_sequential(
                                 if isinstance(extracted_data, list):
                                     for item in extracted_data:
                                         if isinstance(item, dict):
-                                            phone_number = item.get('phone', '')
+                                            phone_number = item.get('phone', '').replace(' ', '')
                                             contact_person = item.get('contact_person', '')
                                             contact_entry = {
                                                 'contact_person': contact_person,
@@ -492,7 +512,7 @@ async def grab_dealer_info_sequential(
                                                 extracted_valid_data = True
                                                 
                                 elif isinstance(extracted_data, dict):
-                                    phone_number = extracted_data.get('phone', '')
+                                    phone_number = extracted_data.get('phone', '').replace(' ', '')
                                     contact_person = extracted_data.get('contact_person', '')
                                     contact_entry = {
                                         'contact_person': contact_person,
@@ -1548,6 +1568,93 @@ def determine_max_subcategories(machines_df: pd.DataFrame) -> int:
     buffer = max(int(max_subcategories * 0.2), 5)
     return max_subcategories + buffer
 
+def clean_merged_dataframe(merged_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Clean merged DataFrame by removing duplicate columns and fixing merge artifacts.
+    
+    Args:
+        merged_df (pd.DataFrame): DataFrame with potential merge artifacts
+        
+    Returns:
+        pd.DataFrame: Cleaned DataFrame
+    """
+    logging.info("Cleaning merged DataFrame to remove duplicate columns and merge artifacts")
+    
+    cleaned_df = merged_df.copy()
+    
+    # Fix duplicate columns with _x and _y suffixes
+    columns_to_rename = {}
+    columns_to_drop = []
+    
+    for col in cleaned_df.columns:
+        if col.endswith('_x'):
+            base_name = col[:-2]
+            y_col = f"{base_name}_y"
+            
+            if y_col in cleaned_df.columns:
+                # Keep the _y version (usually more specific) and rename it
+                columns_to_rename[y_col] = base_name
+                columns_to_drop.append(col)
+                logging.debug(f"Merging columns: keeping {y_col} as {base_name}, dropping {col}")
+            else:
+                # Just rename _x to base name
+                columns_to_rename[col] = base_name
+    
+    # Apply renames and drops
+    if columns_to_rename:
+        cleaned_df = cleaned_df.rename(columns=columns_to_rename)
+        logging.info(f"Renamed columns: {columns_to_rename}")
+    
+    if columns_to_drop:
+        cleaned_df = cleaned_df.drop(columns=columns_to_drop)
+        logging.info(f"Dropped duplicate columns: {columns_to_drop}")
+    
+    # Remove address_raw_html since it's duplicate of address_raw
+    if 'address_raw_html' in cleaned_df.columns and 'address_raw' in cleaned_df.columns:
+        cleaned_df = cleaned_df.drop(columns=['address_raw_html'])
+        logging.info("Removed duplicate address_raw_html column")
+    
+    # Convert count fields to integers where possible
+    if 'count' in cleaned_df.columns:
+        try:
+            cleaned_df['count'] = pd.to_numeric(cleaned_df['count'], errors='coerce').fillna(0).astype(int)
+            logging.info("Converted count column to integer")
+        except Exception as e:
+            logging.warning(f"Could not convert count to integer: {e}")
+    
+    # Clean sub_categories count fields
+    if 'sub_categories' in cleaned_df.columns:
+        def clean_subcategory_counts(sub_cats):
+            # Handle the case where sub_cats might be None, NaN, or not a list
+            try:
+                if sub_cats is None or (hasattr(sub_cats, '__len__') and len(str(sub_cats).strip()) == 0):
+                    return sub_cats
+                if not isinstance(sub_cats, (list, tuple)):
+                    return sub_cats
+                
+                # Process each subcategory
+                for sub_cat in sub_cats:
+                    if isinstance(sub_cat, dict) and 'count' in sub_cat:
+                        try:
+                            sub_cat['count'] = int(sub_cat['count']) if sub_cat['count'] else 0
+                        except (ValueError, TypeError):
+                            sub_cat['count'] = 0
+                return sub_cats
+            except Exception as e:
+                # If any error occurs, just return the original value
+                logging.warning(f"Error cleaning subcategory counts: {e}")
+                return sub_cats
+        
+        try:
+            cleaned_df['sub_categories'] = cleaned_df['sub_categories'].apply(clean_subcategory_counts)
+            logging.info("Cleaned sub_categories count fields")
+        except Exception as e:
+            logging.warning(f"Could not clean sub_categories count fields: {e}")
+    
+    logging.info(f"Cleaned DataFrame: {len(cleaned_df)} rows, {len(cleaned_df.columns)} columns")
+    return cleaned_df
+
+
 async def main():
     """
     Main function for scraping dealers and their machine data using pandas DataFrames.
@@ -1634,7 +1741,7 @@ async def main():
 
         # Merge dealers data with machines data on dealer_id
         if not machines_data.empty:
-            merged_df = pd.merge(dealers_df, machines_data, on='dealer_id', how='left')
+            merged_df = pd.merge(dealers_df, machines_data, on='dealer_id', how='left', suffixes=('_dealer', '_machine'))
             logging.info(f"Merged dealers and machines data: {len(merged_df)} records")
         else:
             merged_df = dealers_df.copy()
@@ -1644,7 +1751,7 @@ async def main():
         if not contact_info_data.empty:
             # Rename 'id' column to 'dealer_id' in contact_info_data for merging
             contact_info_data_renamed = contact_info_data.rename(columns={'id': 'dealer_id'})
-            merged_df = pd.merge(merged_df, contact_info_data_renamed, on='dealer_id', how='left')
+            merged_df = pd.merge(merged_df, contact_info_data_renamed, on='dealer_id', how='left', suffixes=('', '_contact'))
             logging.info(f"Merged with contact information: {len(merged_df)} records")
         else:
             # Add empty contact columns if no contact data was retrieved
@@ -1652,6 +1759,9 @@ async def main():
             merged_df['phone_number'] = ''
             merged_df['fax_number'] = ''
             logging.warning("No contact information found, added empty contact columns")
+
+        # Clean merged DataFrame to fix any remaining merge artifacts
+        merged_df = clean_merged_dataframe(merged_df)
 
         # Save results to files
         if not merged_df.empty:
@@ -1726,7 +1836,11 @@ if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        datefmt="%H:%M:%S"
+        datefmt="%H:%M:%S",
+        handlers=[
+            logging.FileHandler('app.log', mode='a'),
+            logging.StreamHandler()
+        ]
     )
     asyncio.run(main())
-    #asyncio.run(grab_dealer_info_sequential(dealer_links=[ "/Haendler/47558/wmw-ag-leipzig", "/Haendler/49713/dynamic-power-laser-gmbh-leipzig", "/Haendler/66037/iob-industrieofenanlagen-vertrieb-gmbh-hartha", "/Haendler/46836/mhl-maschinenhandel-andreas-ludewig-bad-sulza", "/Haendler/86079/maveg-maschinen-vertriebs-gesellschaft-mbh-chemnitz"]))
+    #asyncio.run(grab_dealer_info_sequential(dealer_links=[ "/Haendler/165539/kirchner-partner-heben-und-foerdern-gmbh-weimar", "/Haendler/54162/lrtt-gmbh-weissenborn"]))

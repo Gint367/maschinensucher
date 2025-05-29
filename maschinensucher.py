@@ -1,12 +1,8 @@
 import argparse
-from ast import parse
 import asyncio
-import csv
-from encodings.punycode import T
 import json
 import logging
 import os
-import random
 import re
 import time
 from datetime import datetime
@@ -18,79 +14,21 @@ from crawl4ai import (
     AsyncWebCrawler,
     BrowserConfig,
     CacheMode,
-    CrawlerMonitor,
     CrawlerRunConfig,
     CrawlResult,
-    DisplayMode,
     JsonCssExtractionStrategy,
     LLMConfig,
     MemoryAdaptiveDispatcher
 )
 from crawl4ai.content_scraping_strategy import LXMLWebScrapingStrategy  # Add this import
+from helpers import (
+    is_valid_phone_number,
+    exponential_backoff_delay,
+    extract_dealer_id_from_link,
+)
+
 browser_config = BrowserConfig(headless=True, verbose=True, text_mode=True)
 
-def is_valid_phone_number(phone_str: str) -> bool:
-    """
-    Check if a phone string contains a valid phone number.
-    Returns False if it contains error messages or is not a proper phone number.
-    
-    Args:
-        phone_str (str): Phone number string to validate
-        
-    Returns:
-        bool: True if valid phone number, False otherwise
-    """
-    if not phone_str or not phone_str.strip():
-        return False
-    
-    phone_str = phone_str.strip()
-    
-    # Check for German error messages
-    error_messages = [
-        "Die Telefonnummer kann aktuell nicht abgerufen werden",
-        "bitte versuchen Sie es später erneut",
-        "Telefonnummer nicht verfügbar",
-        "nicht erreichbar",
-        "temporarily unavailable",
-        "not available"
-    ]
-    
-    # If any error message is found, it's not a valid phone number
-    for error_msg in error_messages:
-        if error_msg.lower() in phone_str.lower():
-            return False
-    
-    # Basic phone number pattern validation (German and international formats)
-    # Allow numbers with +, spaces, hyphens, parentheses, and typical separators
-    phone_pattern = r'^[\+]?[\d\s\-\(\)\/\.]{7,20}$'
-    
-    # Remove common separators for pattern matching
-    cleaned_phone = re.sub(r'[\s\-\(\)\/\.]', '', phone_str)
-    
-    # Must contain at least 7 digits and not be all zeros
-    if len(cleaned_phone) < 7 or cleaned_phone.replace('+', '').replace('0', '') == '':
-        return False
-    
-    return bool(re.match(phone_pattern, phone_str))
-
-async def exponential_backoff_delay(attempt: int, base_delay: float = 1.0, max_delay: float = 30.0) -> None:
-    """
-    Apply exponential backoff delay with jitter.
-    
-    Args:
-        attempt (int): Current attempt number (0-based)
-        base_delay (float): Base delay in seconds
-        max_delay (float): Maximum delay in seconds
-    """
-    # Calculate exponential delay: base_delay * 2^attempt
-    delay = min(base_delay * (2 ** attempt), max_delay)
-    
-    # Add jitter (±25% randomness) to prevent thundering herd
-    jitter = delay * 0.25 * (2 * random.random() - 1)
-    final_delay = max(0, delay + jitter)
-    
-    logging.debug(f"Applying exponential backoff: attempt {attempt + 1}, delay {final_delay:.2f}s")
-    await asyncio.sleep(final_delay)
 
 def load_schemas_from_json(
     schema_file_path: str = os.path.join("schemas", "dealer_schema.json"),
@@ -291,7 +229,7 @@ async def grab_dealer_info_parallel( # TODO: NOT WORKING YET, use se sequential 
         headless=True, 
         verbose=True, 
         text_mode=True,
-        user_data_dir=os.path.join("browser_data", f"maschinensucher_dealer")
+        user_data_dir=os.path.join("browser_data", "maschinensucher_dealer")
     )
     async with AsyncWebCrawler(config=special_browser_config) as crawler:
         # Convert relative links to absolute URLs if needed
@@ -394,9 +332,9 @@ async def grab_dealer_info_parallel( # TODO: NOT WORKING YET, use se sequential 
 
 async def grab_dealer_info_sequential(
     dealer_links,
-    delay_between_requests: float = 2.0,
-    max_retries: int = 3,
-    retry_base_delay: float = 2.0,
+    delay_between_requests: float = 5.0,
+    max_retries: int = 1,
+    retry_base_delay: float = 5.0,
     retry_max_delay: float = 30.0
 ) -> pd.DataFrame:
     """
@@ -487,14 +425,16 @@ async def grab_dealer_info_sequential(
         
         # Retry logic for each dealer
         dealer_success = False
+        contact_person = ''
         for attempt in range(max_retries + 1):  # +1 for initial attempt
             try:
                 # Create a fresh crawler instance for each attempt
                 special_browser_config = BrowserConfig(
                     headless=True, 
-                    verbose=False,
-                    use_persistent_context=True,
-                    user_data_dir=os.path.join("browser_data", f"maschinensucher_dealer_{dealer_id}")
+                    verbose=True,
+                    browser_mode="builtin",
+                    text_mode=True,
+                    
                 )
                 
                 async with AsyncWebCrawler(config=special_browser_config) as crawler:
@@ -506,6 +446,7 @@ async def grab_dealer_info_sequential(
                         delay_before_return_html=2.0,
                         keep_attrs=["id", "class"],
                         keep_data_attributes=True,
+                        magic=True,  # Enable magic mode for better JS handling
                     )
                     
                     # Crawl the individual page
@@ -537,8 +478,9 @@ async def grab_dealer_info_sequential(
                                     for item in extracted_data:
                                         if isinstance(item, dict):
                                             phone_number = item.get('phone', '')
+                                            contact_person = item.get('contact_person', '')
                                             contact_entry = {
-                                                'contact_person': item.get('contact_person', ''),
+                                                'contact_person': contact_person,
                                                 'phone_number': phone_number,
                                                 'fax_number': item.get('fax', ''),
                                                 'id': dealer_id
@@ -551,8 +493,9 @@ async def grab_dealer_info_sequential(
                                                 
                                 elif isinstance(extracted_data, dict):
                                     phone_number = extracted_data.get('phone', '')
+                                    contact_person = extracted_data.get('contact_person', '')
                                     contact_entry = {
-                                        'contact_person': extracted_data.get('contact_person', ''),
+                                        'contact_person': contact_person,
                                         'phone_number': phone_number,
                                         'fax_number': extracted_data.get('fax', ''),
                                         'id': dealer_id
@@ -566,7 +509,7 @@ async def grab_dealer_info_sequential(
                             except Exception as e:
                                 logging.error(f"Error extracting data from schema {schema_name} for dealer {dealer_id}: {str(e)}")
                                 continue
-                          # Check if we extracted valid data
+                        # Check if we extracted valid data
                         if extracted_valid_data:
                             logging.info(f"Successfully extracted valid contact data for dealer {dealer_id} on attempt {attempt + 1}")
                             # Add the extracted data to final results
@@ -599,11 +542,11 @@ async def grab_dealer_info_sequential(
                     logging.info(f"Retrying dealer {dealer_id} in {retry_base_delay * (2 ** attempt):.1f}s...")
                     await exponential_backoff_delay(attempt, retry_base_delay, retry_max_delay)
         
-        # If all attempts failed, add empty entry to maintain data consistency
+        # If all attempts failed, leave the phone number empty
         if not dealer_success:
-            logging.error(f"All attempts failed for dealer {dealer_id}, adding empty entry")
+            logging.error(f"All attempts failed for dealer {dealer_id}, leave phone number empty")
             empty_entry = {
-                'contact_person': '',
+                'contact_person': contact_person,
                 'phone_number': '',
                 'fax_number': '',
                 'id': dealer_id
@@ -617,12 +560,12 @@ async def grab_dealer_info_sequential(
     if df.empty:
         df = pd.DataFrame(columns=['contact_person', 'phone_number', 'fax_number', 'id'])
     # Print DataFrame contents for debugging
-    print("\n=== CONTACT DETAILS DATAFRAME ===")
-    print(f"DataFrame shape: {df.shape}")
-    print(f"Columns: {list(df.columns)}")
-    print("\nDataFrame contents:")
-    print(df.to_string())
-    print("\n" + "="*50)
+    logging.debug("\n=== CONTACT DETAILS DATAFRAME ===")
+    logging.debug(f"DataFrame shape: {df.shape}")
+    logging.debug(f"Columns: {list(df.columns)}")
+    logging.info("\nDataFrame contents:")
+    logging.info(df.to_string())
+    logging.debug("\n" + "="*50)
     logging.info(f"Successfully extracted contact details for {len(df)} dealers")
     return df
 
@@ -960,6 +903,111 @@ def enrich_dealer_with_address_data(dealer: Dict[str, Any]) -> Dict[str, Any]:
     return dealer
 
 
+def clean_value_for_json(value, default=''):
+    """
+    Clean a single value for JSON serialization by handling NaN and None values.
+    
+    Args:
+        value: The value to clean
+        default: Default value to use if value is NaN or None
+        
+    Returns:
+        Cleaned value safe for JSON serialization
+    """
+    if pd.isna(value) or value is None:
+        return default
+    return value
+
+
+async def build_schema_generic(
+    schema_type: str,
+    schema_file_name: str,
+    cleaned_html: str,
+    schema_generators: List[Dict[str, Any]],
+    force: bool = False
+) -> List[Dict[str, Any]]:
+    """
+    Generic schema builder that eliminates redundant logic between build_schema_dealer and build_schema_machines.
+    
+    Args:
+        schema_type (str): Type of schema being built (for logging)
+        schema_file_name (str): Name of the schema file (e.g., "dealer_schema.json")
+        cleaned_html (str): HTML content for schema generation
+        schema_generators (List[Dict[str, Any]]): List of schema generator configurations
+        force (bool): Force regeneration of schema
+        
+    Returns:
+        List[Dict[str, Any]]: List of schema dictionaries
+    """
+    schema_file_path = os.path.join("schemas", schema_file_name)
+
+    # Try to load existing schemas first (unless force=True)
+    if os.path.exists(schema_file_path) and not force:
+        try:
+            existing_schemas = load_schemas_from_json(schema_file_path)
+            logging.info(f"Successfully loaded {len(existing_schemas)} existing {schema_type} schemas")
+            return existing_schemas
+        except Exception as e:
+            logging.warning(f"Failed to load existing {schema_type} schemas: {str(e)}. Will regenerate...")
+            force = True  # Force regeneration if loading fails
+
+    # Generate new schemas if no existing schemas or force=True
+    if not cleaned_html and force:
+        logging.warning(f"No HTML provided for {schema_type} schema generation, but force=True. Cannot generate new schemas.")
+        if os.path.exists(schema_file_path):
+            logging.info(f"Falling back to existing {schema_type} schema file...")
+            return load_schemas_from_json(schema_file_path)
+        else:
+            raise ValueError(f"Cannot generate {schema_type} schemas without HTML content and no existing schema file found")
+
+    if not cleaned_html:
+        logging.warning(f"No HTML provided and no existing {schema_type} schema file found. Cannot proceed.")
+        raise ValueError(f"HTML content required for {schema_type} schema generation when no existing schema file exists")
+
+    logging.info(f"Building {schema_type} schemas...")
+    generated_schemas = []
+
+    try:
+        # Process each schema generator
+        for generator_config in schema_generators:
+            logging.info(f"Generating {generator_config['name']} schema...")
+            
+            schema = JsonCssExtractionStrategy.generate_schema(
+                html=cleaned_html,
+                llm_config=LLMConfig(
+                    provider="gemini/gemini-2.5-pro-preview-05-06",
+                    api_token=os.getenv("GEMINI_API_KEY", ""),
+                ),
+                target_json_example=generator_config['target_json_example'],
+                query=generator_config['query']
+            )
+
+            # Handle single schema or list of schemas from generator
+            if isinstance(schema, dict):
+                generated_schemas.append(schema)
+            elif isinstance(schema, list):
+                generated_schemas.extend(schema)
+
+        if not generated_schemas:
+            raise ValueError(f"No {schema_type} schemas were generated successfully")
+
+        # Robustly save all generated schemas to JSON file
+        os.makedirs(os.path.dirname(schema_file_path), exist_ok=True)
+        with open(schema_file_path, "w", encoding="utf-8") as f:
+            json.dump(generated_schemas, f, indent=4, ensure_ascii=False)
+
+        logging.info(f"Successfully generated and saved {len(generated_schemas)} {schema_type} schemas to {schema_file_path}")
+        return generated_schemas
+
+    except Exception as e:
+        logging.error(f"Error generating {schema_type} schemas: {str(e)}")
+        # Try to fall back to existing schemas if generation fails
+        if os.path.exists(schema_file_path) and not force:
+            logging.info(f"{schema_type.title()} schema generation failed, falling back to existing schemas...")
+            return load_schemas_from_json(schema_file_path)
+        raise
+
+
 async def build_schema_dealer(
     cleaned_html: str, force: bool = False
 ) -> List[Dict[str, Any]]:
@@ -975,118 +1023,36 @@ async def build_schema_dealer(
     Returns:
         List[Dict[str, Any]]: List of schema dictionaries
     """
-    schema_file_path = os.path.join("schemas", "dealer_schema.json")
-
-    # Try to load existing schemas first (unless force=True)
-    if os.path.exists(schema_file_path) and not force:
-        try:
-            existing_schemas = load_schemas_from_json(schema_file_path)
-            logging.info(
-                f"Successfully loaded {len(existing_schemas)} existing schemas"
-            )
-            return existing_schemas
-        except Exception as e:
-            logging.warning(
-                f"Failed to load existing schemas: {str(e)}. Will regenerate..."
-            )
-            force = True  # Force regeneration if loading fails
-
-    # Generate new schemas if no existing schemas or force=True
-    if not cleaned_html and force:
-        logging.warning(
-            "No HTML provided for schema generation, but force=True. Cannot generate new schemas."
-        )
-        if os.path.exists(schema_file_path):
-            logging.info("Falling back to existing schema file...")
-            return load_schemas_from_json(schema_file_path)
-        else:
-            raise ValueError(
-                "Cannot generate schemas without HTML content and no existing schema file found"
-            )
-
-    if not cleaned_html:
-        logging.warning(
-            "No HTML provided and no existing schema file found. Cannot proceed."
-        )
-        raise ValueError(
-            "HTML content required for schema generation when no existing schema file exists"
-        )
-
-    logging.info("Building dealer schemas...")
-    generated_schemas = []
-
-    try:
-        # Schema Generator 1: Dealer Card Schema
-        logging.info("Generating Maschinensucher Dealer Card schema...")
-        dealer_schema = JsonCssExtractionStrategy.generate_schema(
-            html=cleaned_html,
-            llm_config=LLMConfig(
-                provider="gemini/gemini-2.5-pro-preview-05-06",
-                api_token=os.getenv("GEMINI_API_KEY", ""),
-            ),
-            target_json_example="""{
+    schema_generators = [
+        {
+            "name": "Maschinensucher Dealer Card",
+            "target_json_example": """{
                 "company name": "...",
                 "address": "...",
                 "distance": "...",
                 "link": "...",
                 "attributes": "...",
             }""",
-            query="""The given html is the crawled html from Maschinensucher website search result. Please find the schema for dealer information in the given html. Name the schema as "Maschinensucher Dealer Card". I am interested in the dealer company name, the address(save this as html because i need to preserve the <br> format), the distance from the detected location, and the maschinensucher page link for the company.
+            "query": """The given html is the crawled html from Maschinensucher website search result. Please find the schema for dealer information in the given html. Name the schema as "Maschinensucher Dealer Card". I am interested in the dealer company name, the address(save this as html because i need to preserve the <br> format), the distance from the detected location, and the maschinensucher page link for the company.
             """,
-        )
-
-        # Handle single schema or list of schemas from generator
-        if isinstance(dealer_schema, dict):
-            generated_schemas.append(dealer_schema)
-        elif isinstance(dealer_schema, list):
-            generated_schemas.extend(dealer_schema)
-
-        # Schema Generator 2: Category Text Schema
-        logging.info("Generating Category Text schema...")
-        category_schema = JsonCssExtractionStrategy.generate_schema(
-            html=cleaned_html,
-            llm_config=LLMConfig(
-                provider="gemini/gemini-2.5-pro-preview-05-06",
-                api_token=os.getenv("GEMINI_API_KEY", ""),
-            ),
-            target_json_example="""{
+        },
+        {
+            "name": "Category Text",
+            "target_json_example": """{
                 "text": "..."
             }""",
-            query="""The given html is the crawled html from Maschinensucher website search result. Please find the schema for extracting the category/page title text. Name the schema as "Category Text". I am interested in extracting the main category title/heading text from the page.
+            "query": """The given html is the crawled html from Maschinensucher website search result. Please find the schema for extracting the category/page title text. Name the schema as "Category Text". I am interested in extracting the main category title/heading text from the page.
             """,
-        )
+        }
+    ]
 
-        # Handle category schema
-        if isinstance(category_schema, dict):
-            generated_schemas.append(category_schema)
-        elif isinstance(category_schema, list):
-            generated_schemas.extend(category_schema)
-
-        # Future schema generators can be added here
-        # Schema Generator 3: Additional schemas...
-
-        if not generated_schemas:
-            raise ValueError("No schemas were generated successfully")
-
-        # Robustly save all generated schemas to JSON file
-        os.makedirs(os.path.dirname(schema_file_path), exist_ok=True)
-        with open(schema_file_path, "w", encoding="utf-8") as f:
-            json.dump(generated_schemas, f, indent=4, ensure_ascii=False)
-
-        logging.info(
-            f"Successfully generated and saved {len(generated_schemas)} schemas to {schema_file_path}"
-        )
-        return generated_schemas
-
-    except Exception as e:
-        logging.error(f"Error generating schemas: {str(e)}")
-        # Try to fall back to existing schemas if generation fails
-        if os.path.exists(schema_file_path) and not force:
-            logging.info(
-                "Schema generation failed, falling back to existing schemas..."
-            )
-            return load_schemas_from_json(schema_file_path)
-        raise
+    return await build_schema_generic(
+        schema_type="dealer",
+        schema_file_name="dealer_schema.json",
+        cleaned_html=cleaned_html,
+        schema_generators=schema_generators,
+        force=force
+    )
 
 
 async def build_schema_machines(
@@ -1104,56 +1070,10 @@ async def build_schema_machines(
     Returns:
         List[Dict[str, Any]]: List of machine schema dictionaries
     """
-    schema_file_path = os.path.join("schemas", "machines_schema.json")
-
-    # Try to load existing schemas first (unless force=True)
-    if os.path.exists(schema_file_path) and not force:
-        try:
-            existing_schemas = load_schemas_from_json(schema_file_path)
-            logging.info(
-                f"Successfully loaded {len(existing_schemas)} existing machine schemas"
-            )
-            return existing_schemas
-        except Exception as e:
-            logging.warning(
-                f"Failed to load existing machine schemas: {str(e)}. Will regenerate..."
-            )
-            force = True  # Force regeneration if loading fails
-
-    # Generate new schemas if no existing schemas or force=True
-    if not cleaned_html and force:
-        logging.warning(
-            "No HTML provided for schema generation, but force=True. Cannot generate new machine schemas."
-        )
-        if os.path.exists(schema_file_path):
-            logging.info("Falling back to existing machine schema file...")
-            return load_schemas_from_json(schema_file_path)
-        else:
-            raise ValueError(
-                "Cannot generate machine schemas without HTML content and no existing schema file found"
-            )
-
-    if not cleaned_html:
-        logging.warning(
-            "No HTML provided and no existing machine schema file found. Cannot proceed."
-        )
-        raise ValueError(
-            "HTML content required for machine schema generation when no existing schema file exists"
-        )
-
-    logging.info("Building machine schemas...")
-    generated_schemas = []
-
-    try:
-        # Schema Generator 1: Machine Category Schema
-        logging.info("Generating Machine Category Filter schema...")
-        machine_category_schema = JsonCssExtractionStrategy.generate_schema(
-            html=cleaned_html,
-            llm_config=LLMConfig(
-                provider="gemini/gemini-2.5-pro-preview-05-06",
-                api_token=os.getenv("GEMINI_API_KEY", ""),
-            ),
-            target_json_example="""[
+    schema_generators = [
+        {
+            "name": "Machine Category Filter",
+            "target_json_example": """[
                 {
                     "category_name": "...maschinen",
                     "count": 5,
@@ -1165,42 +1085,18 @@ async def build_schema_machines(
                     ]
                 }
             ]""",
-            query="""The provided HTML snippet is from a maschinensucher website and displays category filters. Please generate a schema named 'MachineCategoryFilter' to extract the category and subcategory information. For each main category, I need its name, the count of items (the number in parentheses). Each main category might have a list of subcategories. For each subcategory, I also need its name, and count of items.
+            "query": """The provided HTML snippet is from a maschinensucher website and displays category filters. Please generate a schema named 'MachineCategoryFilter' to extract the category and subcategory information. For each main category, I need its name, the count of items (the number in parentheses). Each main category might have a list of subcategories. For each subcategory, I also need its name, and count of items.
             """,
-        )
+        }
+    ]
 
-        # Handle single schema or list of schemas from generator
-        if isinstance(machine_category_schema, dict):
-            generated_schemas.append(machine_category_schema)
-        elif isinstance(machine_category_schema, list):
-            generated_schemas.extend(machine_category_schema)
-
-        # Future schema generators can be added here
-        # Schema Generator 2: Machine Details Schema...
-        # Schema Generator 3: Additional schemas...
-
-        if not generated_schemas:
-            raise ValueError("No machine schemas were generated successfully")
-
-        # Robustly save all generated schemas to JSON file
-        os.makedirs(os.path.dirname(schema_file_path), exist_ok=True)
-        with open(schema_file_path, "w", encoding="utf-8") as f:
-            json.dump(generated_schemas, f, indent=4, ensure_ascii=False)
-
-        logging.info(
-            f"Successfully generated and saved {len(generated_schemas)} machine schemas to {schema_file_path}"
-        )
-        return generated_schemas
-
-    except Exception as e:
-        logging.error(f"Error generating machine schemas: {str(e)}")
-        # Try to fall back to existing schemas if generation fails
-        if os.path.exists(schema_file_path) and not force:
-            logging.info(
-                "Machine schema generation failed, falling back to existing schemas..."
-            )
-            return load_schemas_from_json(schema_file_path)
-        raise
+    return await build_schema_generic(
+        schema_type="machine",
+        schema_file_name="machines_schema.json",
+        cleaned_html=cleaned_html,
+        schema_generators=schema_generators,
+        force=force
+    )
 
 
 def clean_machine_data(machine_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -1263,13 +1159,14 @@ def clean_machine_data(machine_data: Dict[str, Any]) -> Dict[str, Any]:
     return cleaned
 
 
-def process_machine_data_for_dealer(machines_df: pd.DataFrame, dealer_id: str) -> Dict[str, Any]:
+def process_machine_data_for_dealer(machines_df: pd.DataFrame, dealer_id: str, max_subcategories: int = None) -> Dict[str, Any]:
     """
-    Process machine data for a specific dealer and generate category analytics.
+    Process machine data for a specific dealer and generate category analytics with dynamic subcategory handling.
     
     Args:
         machines_df (pd.DataFrame): DataFrame containing machine data
         dealer_id (str): Dealer ID to process
+        max_subcategories (int): Maximum number of subcategories to process (if None, process all)
     
     Returns:
         Dict[str, Any]: Dictionary containing main category and subcategory analytics
@@ -1299,11 +1196,13 @@ def process_machine_data_for_dealer(machines_df: pd.DataFrame, dealer_id: str) -
             if main_category and not pd.isna(main_category):
                 analytics['main_category'] = str(main_category)
                 analytics['main_category_count'] = str(main_count) if not pd.isna(main_count) else '0'
-            
-            # Extract subcategory information
+              # Extract subcategory information with dynamic limit
             sub_categories = cleaned_machine.get('sub_categories', [])
             if sub_categories and isinstance(sub_categories, (list, tuple)):
-                for i, sub_cat in enumerate(sub_categories[:15], 1):  # Limit to 15 subcategories
+                # Use provided max or process all subcategories
+                limit = max_subcategories if max_subcategories else len(sub_categories)
+                
+                for i, sub_cat in enumerate(sub_categories[:limit], 1):
                     if isinstance(sub_cat, dict):
                         sub_name = sub_cat.get('category_name', '')
                         sub_count = sub_cat.get('count', 0)
@@ -1321,7 +1220,7 @@ def process_machine_data_for_dealer(machines_df: pd.DataFrame, dealer_id: str) -
 
 def generate_category_analytics_columns(merged_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Generate category analytics columns from machine data in the merged DataFrame.
+    Generate category analytics columns from machine data with dynamic subcategory limits.
     
     Args:
         merged_df (pd.DataFrame): Merged DataFrame containing dealer and machine data
@@ -1334,42 +1233,48 @@ def generate_category_analytics_columns(merged_df: pd.DataFrame) -> pd.DataFrame
     # Create a copy to avoid modifying the original
     enhanced_df = merged_df.copy()
     
-    # Initialize category analytics columns
+    # Create a temporary DataFrame with just machine data columns
+    machine_columns = ['dealer_id', 'category_name', 'count', 'sub_categories']
+    available_machine_columns = [col for col in machine_columns if col in enhanced_df.columns]
+    
+    # Dynamically determine the maximum number of subcategories needed
+    if 'sub_categories' in enhanced_df.columns:
+        machines_df = enhanced_df[available_machine_columns].dropna(subset=['dealer_id'])
+        max_subcategories = determine_max_subcategories(machines_df)
+        logging.info(f"Detected maximum subcategories needed: {max_subcategories}")
+    else:
+        max_subcategories = 0
+        logging.warning("No sub_categories column found, setting max subcategories to 0")
+    
+    # Initialize category analytics columns dynamically
     category_columns = ['main_category', 'main_category_count']
     
-    # Add subcategory columns (up to 15)
-    for i in range(1, 16):
+    # Add subcategory columns based on detected maximum
+    for i in range(1, max_subcategories + 1):
         category_columns.extend([f'sub_category_{i}', f'sub_category_{i}_count'])
     
     # Initialize all category columns with empty strings
     for col in category_columns:
         enhanced_df[col] = ''
-    
-    # Get unique dealer IDs that have machine data
+      # Get unique dealer IDs that have machine data
     dealers_with_machines = enhanced_df[enhanced_df['dealer_id'].notna() & (enhanced_df['dealer_id'] != '')]
     
     if dealers_with_machines.empty:
         logging.warning("No dealers with machine data found for category analytics")
         return enhanced_df
-    
-    # Create a temporary DataFrame with just machine data columns
-    machine_columns = ['dealer_id', 'category_name', 'count', 'sub_categories']
-    available_machine_columns = [col for col in machine_columns if col in enhanced_df.columns]
-    
+
     if len(available_machine_columns) <= 1:  # Only dealer_id
         logging.warning("No machine data columns found for category analytics")
         return enhanced_df
-    
-    machines_df = enhanced_df[available_machine_columns].dropna(subset=['dealer_id'])
-    
+
     # Process each dealer's machine data
     processed_dealers = 0
     for dealer_id in dealers_with_machines['dealer_id'].unique():
         if pd.isna(dealer_id) or dealer_id == '':
             continue
             
-        # Generate analytics for this dealer
-        analytics = process_machine_data_for_dealer(machines_df, str(dealer_id))
+        # Generate analytics for this dealer with dynamic subcategory limit
+        analytics = process_machine_data_for_dealer(machines_df, str(dealer_id), max_subcategories)
         
         if analytics:
             # Update the DataFrame with analytics for this dealer
@@ -1385,7 +1290,7 @@ def generate_category_analytics_columns(merged_df: pd.DataFrame) -> pd.DataFrame
 
 def prepare_csv(merged_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Prepare and clean merged dealer and machine data for CSV export.
+    Prepare and clean merged dealer and machine data for CSV export with dynamic subcategory handling.
     
     Args:
         merged_df (pd.DataFrame): Merged DataFrame containing dealer and machine data
@@ -1436,9 +1341,9 @@ def prepare_csv(merged_df: pd.DataFrame) -> pd.DataFrame:
         "main_category_count"
     ]
     
-    # Add subcategory fields (up to 15)
-    for i in range(1, 16):
-        essential_fields.extend([f'sub_category_{i}', f'sub_category_{i}_count'])
+    # Dynamically add subcategory fields based on what's available in the DataFrame
+    subcategory_columns = [col for col in prepared_df.columns if col.startswith('sub_category_')]
+    essential_fields.extend(subcategory_columns)
     
     # Keep only essential fields that exist in the DataFrame
     available_fields = [field for field in essential_fields if field in prepared_df.columns]
@@ -1449,6 +1354,10 @@ def prepare_csv(merged_df: pd.DataFrame) -> pd.DataFrame:
     
     logging.info(f"Prepared {len(final_df)} dealer records for CSV export")
     logging.info(f"CSV fields: {', '.join(final_df.columns.tolist())}")
+    
+    # Log the number of dynamic subcategory columns detected
+    num_subcategory_cols = len([col for col in final_df.columns if col.startswith('sub_category_')])
+    logging.info(f"Detected {num_subcategory_cols} dynamic subcategory columns")
 
     return final_df
 
@@ -1481,27 +1390,7 @@ def save_to_csv(prepared_df: pd.DataFrame, filename: str) -> bool:
         return False
 
 
-def extract_dealer_id_from_link(link: str) -> str:
-    """
-    Extract dealer ID from dealer link.
-    
-    Args:
-        link (str): Dealer link in format /Haendler/47038/imexx-systemtechnik-ronnenberg
-        
-    Returns:
-        str: Dealer ID (e.g., "47038")
-    """
-    try:
-        # Split the link by "/" and get the dealer ID part
-        parts = link.strip("/").split("/")
-        if len(parts) >= 2 and parts[0] == "Haendler":
-            return parts[1]
-        else:
-            logging.warning(f"Could not extract dealer ID from link: {link}")
-            return ""
-    except Exception as e:
-        logging.error(f"Error extracting dealer ID from link '{link}': {str(e)}")
-        return ""
+
 
 
 def prepare_json_output(merged_df: pd.DataFrame) -> List[Dict[str, Any]]:
@@ -1525,42 +1414,53 @@ def prepare_json_output(merged_df: pd.DataFrame) -> List[Dict[str, Any]]:
             
         # Get the first row for dealer info (all rows for same dealer should have same dealer info)
         dealer_row = dealer_group.iloc[0]
+          # Create dealer entry with proper NaN handling
+        dealer_entry = {}
+        for field, default in [
+            ('company_name', ''),
+            ('street', ''),
+            ('postal_code', ''),
+            ('city', ''),
+            ('state', ''),
+            ('country', ''),
+            ('distance', ''),
+            ('link', ''),
+            ('category', ''),
+            ('category_id', ''),
+            ('attributes', ''),
+            ('vertrauensiegel', False)
+        ]:
+            value = dealer_row.get(field, default)
+            # Handle pandas NaN values
+            if pd.isna(value):
+                dealer_entry[field] = default
+            else:
+                dealer_entry[field] = value
         
-        # Create dealer entry
-        dealer_entry = {
-            'company_name': dealer_row.get('company_name', ''),
-            'street': dealer_row.get('street', ''),
-            'postal_code': dealer_row.get('postal_code', ''),
-            'city': dealer_row.get('city', ''),
-            'state': dealer_row.get('state', ''),
-            'country': dealer_row.get('country', ''),
-            'distance': dealer_row.get('distance', ''),
-            'link': dealer_row.get('link', ''),
-            'category': dealer_row.get('category', ''),
-            'category_id': dealer_row.get('category_id', ''),
-            'dealer_id': str(dealer_id),
-            'vertrauensiegel': dealer_row.get('vertrauensiegel', False)
-        }
+        dealer_entry['dealer_id'] = str(dealer_id)
         
         # Process machine data if available
         machine_data_rows = dealer_group[dealer_group['category_name'].notna()]
         
-        if not machine_data_rows.empty:
-            # Process each machine data entry for this dealer
+        if not machine_data_rows.empty:            # Process each machine data entry for this dealer
             for _, machine_row in machine_data_rows.iterrows():
-                machine_dict = machine_row.to_dict()
+                # Clean machine row data to handle NaN values
+                machine_dict = {}
+                for key, value in machine_row.to_dict().items():
+                    machine_dict[key] = clean_value_for_json(value, '')
+                
                 cleaned_machine = clean_machine_data(machine_dict)
                 
                 if cleaned_machine:
                     # Create a combined entry with dealer info + cleaned machine data
                     combined_entry = dealer_entry.copy()
                     combined_entry.update({
-                        'category_name': cleaned_machine.get('category_name', ''),
-                        'count': str(cleaned_machine.get('count', '')),
+                        'category_name': clean_value_for_json(cleaned_machine.get('category_name'), ''),
+                        'count': str(clean_value_for_json(cleaned_machine.get('count'), '')),
                         'sub_categories': cleaned_machine.get('sub_categories', []),
-                        'source_url': machine_row.get('source_url', ''),
-                        'category_id_filter': machine_row.get('category_id_filter', ''),
-                        'page_number': machine_row.get('page_number', '')
+                        'source_url': clean_value_for_json(machine_row.get('source_url'), ''),
+                        'category_id_filter': clean_value_for_json(machine_row.get('category_id_filter'), ''),
+                        'page_number': clean_value_for_json(machine_row.get('page_number'), '')
                     })
                     json_output.append(combined_entry)
         else:
@@ -1570,6 +1470,83 @@ def prepare_json_output(merged_df: pd.DataFrame) -> List[Dict[str, Any]]:
     logging.info(f"Prepared {len(json_output)} entries for JSON output")
     return json_output
 
+
+def clean_dataframe_for_json(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Clean DataFrame by replacing NaN values with appropriate defaults for JSON serialization.
+    
+    Args:
+        df (pd.DataFrame): DataFrame to clean
+        
+    Returns:
+        pd.DataFrame: Cleaned DataFrame with no NaN values
+    """
+    logging.info("Cleaning DataFrame for JSON export - replacing NaN values")
+    
+    # Create a copy to avoid modifying the original
+    cleaned_df = df.copy()
+    
+    # Replace NaN values with appropriate defaults based on column type and name
+    for column in cleaned_df.columns:
+        if cleaned_df[column].dtype == 'object':
+            # For string/object columns, replace with empty string
+            cleaned_df[column] = cleaned_df[column].fillna('')
+        elif cleaned_df[column].dtype in ['int64', 'float64']:
+            # For numeric columns, replace with 0 or empty string depending on context
+            if 'count' in column.lower() or 'number' in column.lower():
+                cleaned_df[column] = cleaned_df[column].fillna(0)
+            else:
+                cleaned_df[column] = cleaned_df[column].fillna('')
+        elif cleaned_df[column].dtype == 'bool':
+            # For boolean columns, replace with False
+            cleaned_df[column] = cleaned_df[column].fillna(False)
+        else:
+            # For any other type, replace with empty string
+            cleaned_df[column] = cleaned_df[column].fillna('')
+    
+    # Special handling for specific fields that should have meaningful defaults
+    if 'vertrauensiegel' in cleaned_df.columns:
+        cleaned_df['vertrauensiegel'] = cleaned_df['vertrauensiegel'].fillna(False)
+    
+    if 'attributes' in cleaned_df.columns:
+        cleaned_df['attributes'] = cleaned_df['attributes'].fillna('')
+    
+    logging.info(f"Successfully cleaned {len(cleaned_df)} records for JSON export")
+    return cleaned_df
+
+
+def determine_max_subcategories(machines_df: pd.DataFrame) -> int:
+    """
+    Analyze the machine data to determine the maximum number of subcategories
+    needed across all dealers.
+    
+    Args:
+        machines_df: DataFrame containing machine data with sub_categories column
+        
+    Returns:
+        int: Maximum number of subcategories found
+    """
+    max_subcategories = 0
+    
+    if 'sub_categories' not in machines_df.columns:
+        return max_subcategories
+    
+    for _, row in machines_df.iterrows():
+        sub_categories = row.get('sub_categories', [])
+        if isinstance(sub_categories, (list, tuple)):
+            max_subcategories = max(max_subcategories, len(sub_categories))
+        elif isinstance(sub_categories, str):
+            try:
+                # Handle string representation of lists
+                parsed_sub_cats = json.loads(sub_categories)
+                if isinstance(parsed_sub_cats, list):
+                    max_subcategories = max(max_subcategories, len(parsed_sub_cats))
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
+    
+    # Add some buffer for safety (e.g., 20% more or minimum 5)
+    buffer = max(int(max_subcategories * 0.2), 5)
+    return max_subcategories + buffer
 
 async def main():
     """
@@ -1596,16 +1573,10 @@ async def main():
         help="Force regeneration of dealer schema",
     )
     parser.add_argument(
-        "--parallel",
+        "--contact",
         action="store_true",
         default=False,
-        help="Use parallel execution for machine data crawling (faster for multiple pages)",
-    )
-    parser.add_argument(
-        "--machine-pages",
-        type=int,
-        default=1,
-        help="Number of machine pages to crawl per dealer (default: 1)",
+        help="Extract detailed contact information for dealers (phone, fax, contact person)",
     )
 
     args = parser.parse_args()
@@ -1637,27 +1608,29 @@ async def main():
             logging.warning("No dealers with valid IDs found. Exiting.")
             print("\n=== SCRAPING RESULTS ===")
             print("No dealers with valid IDs found.")
-            return
-
-        # Get machine data using parallel crawling (regardless of --parallel flag)
+            return        # Get machine data using parallel crawling (regardless of --parallel flag)
         logging.info(f"Grabbing machine data for {len(valid_dealers_df)} dealers...")
         dealer_ids_list = valid_dealers_df['dealer_id'].tolist()
-          # Use the first dealer's category_id for machine crawling, or use args.category
+        # Use the first dealer's category_id for machine crawling, or use args.category
         category_code = args.category if args.category else valid_dealers_df['category_id'].iloc[0] if 'category_id' in valid_dealers_df.columns else ""
         
         machines_data = await grab_dealer_machines_parallel(
             dealer_ids=dealer_ids_list,
             category_code=category_code,
-            num_pages=args.machine_pages
+            num_pages=1
         )
         
         logging.info(f"Retrieved machine data: {len(machines_data)} records")
         
-        # Get detailed dealer contact information
-        logging.info(f"Grabbing detailed contact information for {len(valid_dealers_df)} dealers...")
-        dealer_links_list = valid_dealers_df['link'].tolist()
-        contact_info_data = await grab_dealer_info_sequential(dealer_links=dealer_links_list)
-        logging.info(f"Retrieved contact information: {len(contact_info_data)} records")
+        # Get detailed dealer contact information (only if --contact flag is provided)
+        contact_info_data = pd.DataFrame()  # Initialize empty DataFrame
+        if args.contact:
+            logging.info(f"Grabbing detailed contact information for {len(valid_dealers_df)} dealers...")
+            dealer_links_list = valid_dealers_df['link'].tolist()
+            contact_info_data = await grab_dealer_info_sequential(dealer_links=dealer_links_list)
+            logging.info(f"Retrieved contact information: {len(contact_info_data)} records")
+        else:
+            logging.info("Skipping contact information extraction (--contact flag not provided)")
 
         # Merge dealers data with machines data on dealer_id
         if not machines_data.empty:
@@ -1687,19 +1660,20 @@ async def main():
             os.makedirs(output_dir, exist_ok=True)            # Generate filename with category and timestamp
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             category_suffix = f"_{args.category}" if args.category else ""
-            
-            # Save JSON with original structure (without flattened category columns)
+              # Save JSON with original structure (without flattened category columns)
             output_json_file = os.path.join(
                 output_dir, f"dealer_results{category_suffix}_{timestamp}.json"
             )
-            json_ready_data = merged_df.to_dict('records')
+            # Clean DataFrame to remove NaN values before JSON conversion
+            cleaned_for_json = clean_dataframe_for_json(merged_df)
+            json_ready_data = cleaned_for_json.to_dict('records')
             with open(output_json_file, 'w', encoding='utf-8') as f:
                 json.dump(json_ready_data, f, indent=4, ensure_ascii=False)
-            logging.info(f"Results saved to JSON: {output_json_file}")
-
-            # Generate category analytics columns ONLY for CSV
+            logging.info(f"Results saved to JSON: {output_json_file}")            # Generate category analytics columns ONLY for CSV
             csv_df = generate_category_analytics_columns(merged_df)
-            logging.info("Added category analytics columns for CSV output")            # Prepare and save CSV with flattened category columns
+            logging.info("Added category analytics columns for CSV output")
+            
+            # Prepare and save CSV with flattened category columns
             csv_filename = os.path.join(output_dir, f"dealer_results{category_suffix}_{timestamp}.csv")
             prepared_df = prepare_csv(csv_df)
             success = save_to_csv(prepared_df, csv_filename)
@@ -1721,14 +1695,17 @@ async def main():
             print("No machine data found")
         
         # Summary of contact information data
-        if not contact_info_data.empty:
-            dealers_with_contact_info = len(merged_df[(merged_df['contact_person'] != '') | 
-                                                     (merged_df['phone_number'] != '') | 
-                                                     (merged_df['fax_number'] != '')])
-            print(f"Dealers with contact information: {dealers_with_contact_info}/{len(merged_df)}")
-            print(f"Total contact records found: {len(contact_info_data)}")
+        if args.contact:
+            if not contact_info_data.empty:
+                dealers_with_contact_info = len(merged_df[(merged_df['contact_person'] != '') | 
+                                                         (merged_df['phone_number'] != '') | 
+                                                         (merged_df['fax_number'] != '')])
+                print(f"Dealers with contact information: {dealers_with_contact_info}/{len(merged_df)}")
+                print(f"Total contact records found: {len(contact_info_data)}")
+            else:
+                print("No contact information found")
         else:
-            print("No contact information found")
+            print("Contact information extraction was skipped (use --contact to enable)")
         
         if not merged_df.empty:
             print("Results saved to:")
@@ -1752,4 +1729,4 @@ if __name__ == "__main__":
         datefmt="%H:%M:%S"
     )
     asyncio.run(main())
-    #asyncio.run(grab_dealer_info_parallel(dealer_links=[ "/Haendler/47558/wmw-ag-leipzig", "/Haendler/49713/dynamic-power-laser-gmbh-leipzig"]))  # Run the main function asynchronously
+    #asyncio.run(grab_dealer_info_sequential(dealer_links=[ "/Haendler/47558/wmw-ag-leipzig", "/Haendler/49713/dynamic-power-laser-gmbh-leipzig", "/Haendler/66037/iob-industrieofenanlagen-vertrieb-gmbh-hartha", "/Haendler/46836/mhl-maschinenhandel-andreas-ludewig-bad-sulza", "/Haendler/86079/maveg-maschinen-vertriebs-gesellschaft-mbh-chemnitz"]))

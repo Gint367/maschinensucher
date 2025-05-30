@@ -1,12 +1,13 @@
 import argparse
 import asyncio
+from base64 import b64decode
 import json
 import logging
 import os
 import re
 import time
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
@@ -29,6 +30,7 @@ from helpers import (
 
 browser_config = BrowserConfig(headless=True, verbose=True, text_mode=True)
 
+CACHE_MODE = CacheMode.ENABLED
 
 def load_schemas_from_json(
     schema_file_path: str = os.path.join("schemas", "dealer_schema.json"),
@@ -88,7 +90,7 @@ async def grab_dealer_list(
     async with AsyncWebCrawler(config=browser_config) as crawler:
         try:
             crawl_config = CrawlerRunConfig(
-                cache_mode=CacheMode.BYPASS,
+                cache_mode=CacheMode.WRITE_ONLY, # use CacheMode.WRITE_ONLY to get the latest data
                 keep_attrs=["id", "class"],
                 keep_data_attributes=True,
                 delay_before_return_html=1.0,
@@ -100,7 +102,7 @@ async def grab_dealer_list(
                 url = f"https://www.maschinensucher.de/Haendler/tci-{category_code}?page={page}&sort=kilometer"
                 logging.info(f"Crawling page {page}: {url}")
 
-                result = await crawler.arun(
+                result : CrawlResult = await crawler.arun(
                     url,
                     config=crawl_config,
                 )  # type: ignore
@@ -242,7 +244,7 @@ async def grab_dealer_info_parallel( # TODO: NOT WORKING YET, use se sequential 
         
         # Configure crawler
         crawl_config = CrawlerRunConfig(
-            cache_mode=CacheMode.BYPASS,
+            cache_mode=CACHE_MODE,
             js_code=js_code_to_show_phones,
             wait_for='css:body',
             delay_before_return_html=2.0,
@@ -254,7 +256,7 @@ async def grab_dealer_info_parallel( # TODO: NOT WORKING YET, use se sequential 
         schemas = load_schemas_from_json(os.path.join("schemas", "dealer_info.json"))
         
         # Crawl all pages in parallel
-        results: List[CrawlResult] = await crawler.arun_many(urls=full_urls, config=crawl_config)
+        results: List[CrawlResult] = await crawler.arun_many(urls=full_urls, config=crawl_config) # type: ignore
         
         # Process each result
         for i, result in enumerate(results):
@@ -350,6 +352,111 @@ max_retries: int = 2,
 retry_base_delay: float = 6.0,
 retry_max_delay: float = 30.0
 """
+"""
+debug_skip_dealers_list = [
+    # All dealer IDs from dealer_results_2_20250529_223234.csv (100 dealers total)
+    "47038",  # IMEXX Systemtechnik
+    "43859",  # Rottstedt CNC-Feinmechanik
+    "43242",  # KAMI GmbH
+    "50879",  # LASER on demand GmbH
+    "52945",  # BOB-tec
+    "41631",  # D'Cunha Industriemaschinen GmbH
+    "44547",  # TSB GmbH
+    "44971",  # R+G Metallbau GmbH
+    "43521",  # Kaymak Handel & Vertrieb
+    "43637",  # Jens Heydn Maschinen Handels GmbH
+    "44663",  # Kötje Pressenautomation
+    "87819",  # JS Werkzeugmaschinen GmbH
+    "43790",  # BBT GmbH
+    "45935",  # Hüttmann Werkzeugmaschinen GmbH
+    "68416",  # AT Asian Trading ug
+    "77260",  # Airtech Stickstoff GmbH
+    "42335",  # Plum & Partner Werkzeugmaschinen GmbH
+    "42316",  # Fa. Schritt Werkzeug- und Maschinenhandel
+    "61474",  # Drehmatec GmbH
+    "42529",  # Krause Maschinenhandels-& Service GmbH
+    "42829",  # gg german graphics Graphische Maschinen GmbH
+    "43248",  # Kittel Werkzeugmaschinen
+    "90825",  # Oltrogge GmbH & Co. KG
+    "48637",  # Schohl CNC Service.
+    "41554",  # Wiemers AG
+    "42522",  # Klaus Rosenboom Werkzeugmaschinen Handel GmbH
+    "47217",  # Unittool Werkzeugmaschinen GmbH
+    "47087",  # Marcel Pankoke Maschinenhandel
+    "69792",  # AMD-Direkt
+    "41853",  # Mager & Wedemeyer Werkzeugmaschinen GmbH
+    "41549",  # WeMa Pigge GmbH
+    "44160",  # WMTec - Werkzeug Maschinen Technologie
+    "80645",  # Placke GmbH
+    "41797",  # Venker Werkzeugmaschinen GmbH
+    "79601",  # Redrock Automation Ltd.
+    "60324",  # SWH GmbH
+    "48409",  # HKB Wolfgang Glahn
+    "50534",  # LüneHanse Vertriebs GmbH
+    "42732",  # Wiegand Werkzeug & Maschinen GmbH & Co. KG
+    "111121", # Werkzeugmaschinen NC-Service GmbH
+    "42699",  # wolfgang kanning Fertigungseinrichtungen
+    "42309",  # Werny Maschinenhandel
+    "44170",  # Dazer-wzm-Werkzeugmaschinen
+    "78893",  # MPS Frank Müller
+    "44704",  # Firmenberatung Kassel
+    "49735",  # JS Metallbearbeitung
+    "44488",  # SuS Schleiftechnik und Maschinenhandel GmbH
+    "45476",  # Kern Drucklufttechnik GmbH & Co. KG
+    "47421",  # Stiens Werkzeugmaschinen Handelsges. mbH
+    "49390",  # Stange Werkzeugmaschinen GmbH & Co. KG
+    "94503",  # Seyfarth Maschinenhandel
+    "96561",  # Betker & König GmbH
+    "575044", # IRM Anlagenbau GmbH
+    "45344",  # Maturus Finance GmbH
+    "55899",  # Additional dealers from the CSV
+    "46082",
+    "44531",
+    "57567",
+    "42782",
+    "45339",
+    "70316",
+    "52580",
+    "52937",
+    "86265",
+    "47977",
+    "41227",
+    "43597",
+    "47318",
+    "66894",
+    "96024",
+    "46057",
+    "45013",
+    "58186",
+    "50594",
+    "48538",
+    "51976",
+    "46948",
+    "42825",
+    "48642",
+    "66454",
+    "44581",
+    "45704",
+    "55688",
+    "41393",
+    "51329",
+    "67809",
+    "45096",
+    "51536",
+    "42678",
+    "42745",
+    "107170",
+    "42187",
+    "45766",
+    "46640",
+    "41110",
+    "41446",
+    "45728",
+    "42273",
+    "43869",
+    "43339",
+]"""
+debug_skip_dealers_list = []
 async def grab_dealer_info_sequential(
     dealer_links,
     delay_between_requests: float = 8.0,
@@ -380,7 +487,29 @@ async def grab_dealer_info_sequential(
     elif not isinstance(dealer_links, list):
         raise ValueError("dealer_links must be a string or list of strings")
     
-    logging.info(f"Grabbing detailed dealer information for {len(dealer_links)} dealers...")
+    # Filter out dealers that are in the debug skip list
+    original_count = len(dealer_links)
+    filtered_dealer_links = []
+    skipped_dealers = []
+    
+    for dealer_link in dealer_links:
+        dealer_id = extract_dealer_id_from_link(dealer_link)
+        if dealer_id in debug_skip_dealers_list:
+            skipped_dealers.append(dealer_id)
+            logging.debug(f"Skipping dealer {dealer_id} (in debug skip list)")
+        else:
+            filtered_dealer_links.append(dealer_link)
+    
+    dealer_links = filtered_dealer_links
+    
+    if skipped_dealers:
+        logging.info(f"Skipped {len(skipped_dealers)} dealers from debug skip list: {skipped_dealers}")
+    
+    logging.info(f"Processing {len(dealer_links)} dealers (filtered from {original_count} original dealers)...")
+    
+    # Create screenshots directory if it doesn't exist
+    screenshots_dir = os.path.join("output", "error_screenshots")
+    os.makedirs(screenshots_dir, exist_ok=True)
     
     js_code_to_show_phones = """
     (async function() {
@@ -408,6 +537,7 @@ async def grab_dealer_info_sequential(
         // First, click the phone toggle button
         var phoneButton = document.querySelector('#collapse-phone a[data-bs-toggle="collapse"]');
         if (phoneButton) {
+            await new Promise(resolve => setTimeout(resolve, 1000));
             phoneButton.click();
             
             // Wait for the phone div to become visible (has 'show' class and is not hidden)
@@ -454,23 +584,28 @@ async def grab_dealer_info_sequential(
                     verbose=True,
                     browser_mode="builtin",
                     text_mode=True,
+                    user_agent_mode="random",
                     
                 )
                 
                 async with AsyncWebCrawler(config=special_browser_config) as crawler:
                     # Configure crawler
                     crawl_config = CrawlerRunConfig(
-                        cache_mode=CacheMode.BYPASS,
+                        cache_mode=CacheMode.WRITE_ONLY,
                         js_code=js_code_to_show_phones,
-                        wait_for='css:#link-phone',
-                        delay_before_return_html=2.0,
+                        wait_for='css:body',
+                        delay_before_return_html=3.0,
                         keep_attrs=["id", "class"],
                         keep_data_attributes=True,
+                        only_text=True,
                         magic=True,  # Enable magic mode for better JS handling
+                        screenshot=True,  # Enable screenshot capture on error
+                        excluded_tags=["footer"],
+                        excluded_selector='#footer-telephone_number, footer, .footer'  # Exclude footer elements
                     )
                     
                     # Crawl the individual page
-                    result = await crawler.arun(url, config=crawl_config)
+                    result :CrawlResult = await crawler.arun(url, config=crawl_config) # type: ignore
                     
                     if result.success:
                         extracted_valid_data = False
@@ -551,7 +686,23 @@ async def grab_dealer_info_sequential(
                             if attempt < max_retries:
                                 await exponential_backoff_delay(attempt, retry_base_delay, retry_max_delay)
                     else:
-                        logging.error(f"Failed to crawl dealer {dealer_id} on attempt {attempt + 1}: {result.error_message}")
+                        # Failed to crawl - save screenshot for debugging
+                        error_msg = result.error_message or "Unknown error"
+                        logging.error(f"Failed to crawl dealer {dealer_id} on attempt {attempt + 1}: {error_msg}")
+                        
+                        # Save screenshot if available
+                        if hasattr(result, 'screenshot') and result.screenshot:
+                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                            screenshot_filename = f"error_dealer_{dealer_id}_attempt_{attempt + 1}_{timestamp}.png"
+                            screenshot_path = os.path.join(screenshots_dir, screenshot_filename)
+                            
+                            try:
+                                with open(screenshot_path, "wb") as f:
+                                    f.write(b64decode(result.screenshot))
+                                logging.info(f"Saved error screenshot: {screenshot_path}")
+                            except Exception as screenshot_error:
+                                logging.error(f"Failed to save screenshot for dealer {dealer_id}: {str(screenshot_error)}")
+                        
                         if attempt < max_retries:
                             logging.info(f"Retrying dealer {dealer_id} in {retry_base_delay * (2 ** attempt):.1f}s...")
                             await exponential_backoff_delay(attempt, retry_base_delay, retry_max_delay)
@@ -583,8 +734,8 @@ async def grab_dealer_info_sequential(
     logging.debug("\n=== CONTACT DETAILS DATAFRAME ===")
     logging.debug(f"DataFrame shape: {df.shape}")
     logging.debug(f"Columns: {list(df.columns)}")
-    logging.info("\nDataFrame contents:")
-    logging.info(df.to_string())
+    logging.debug("\nDataFrame contents:")
+    logging.debug(df.to_string())
     logging.debug("\n" + "="*50)
     logging.info(f"Successfully extracted contact details for {len(df)} dealers")
     return df
@@ -638,7 +789,7 @@ async def grab_dealer_machines_parallel(
             
             # Configure crawler with conservative rate limiting
             crawl_config = CrawlerRunConfig(
-                cache_mode=CacheMode.BYPASS,
+                cache_mode=CACHE_MODE,
                 keep_attrs=["id", "class"],
                 keep_data_attributes=True,
                 delay_before_return_html=1.0,
@@ -672,7 +823,7 @@ async def grab_dealer_machines_parallel(
             # Ensure results is a list (not a generator)
             if hasattr(results, '__aiter__'):
                 # If it's an async generator, collect all results
-                results = [result async for result in results]
+                results = [result async for result in results] # type: ignore
 
             crawl_duration = time.time() - start_time
             logging.info(f"Parallel crawling completed in {crawl_duration:.2f} seconds")
@@ -692,7 +843,7 @@ async def grab_dealer_machines_parallel(
             total_dealers_processed = 0
             failed_dealers = 0
             
-            for i, result in enumerate(results):
+            for i, result in enumerate(results): # type: ignore
                 dealer_id = dealer_ids[i]
                 url = urls[i]
                 
@@ -1179,7 +1330,9 @@ def clean_machine_data(machine_data: Dict[str, Any]) -> Dict[str, Any]:
     return cleaned
 
 
-def process_machine_data_for_dealer(machines_df: pd.DataFrame, dealer_id: str, max_subcategories: int = None) -> Dict[str, Any]:
+
+
+def process_machine_data_for_dealer(machines_df: pd.DataFrame, dealer_id: str, max_subcategories: Optional[int] = None) -> Dict[str, Any]:
     """
     Process machine data for a specific dealer and generate category analytics with dynamic subcategory handling.
     
@@ -1338,6 +1491,12 @@ def prepare_csv(merged_df: pd.DataFrame) -> pd.DataFrame:
         for _, dealer in vertrauensiegel_dealers.iterrows():
             logging.debug(f"Dealer with Vertrauenssiegel: {dealer.get('company_name', 'Unknown')}")
     
+    # Add dealer_full_page column with complete URL
+    if 'link' in prepared_df.columns:
+        prepared_df['dealer_full_page'] = 'https://www.maschinensucher.de' + prepared_df['link'].astype(str)
+    else:
+        prepared_df['dealer_full_page'] = ''
+    
     # Define the essential fields to keep in CSV
     essential_fields = [
         "vertrauensiegel",
@@ -1348,6 +1507,7 @@ def prepare_csv(merged_df: pd.DataFrame) -> pd.DataFrame:
         "state", 
         "country",
         "distance",
+        "dealer_full_page",
         "link",
         "category",
         "category_id",
@@ -1667,8 +1827,8 @@ async def main():
     parser.add_argument(
         "--category",
         type=str,
-        default="2",
-        help="Category code to scrape dealers from (default: all categories)",
+        default="3",
+        help="Category code to scrape dealers from. the tci-<category> code from the URL (default: 3 for 'Holzbearbeitungsmaschinen')",
     )
     parser.add_argument(
         "--pages", type=int, default=1, help="Number of pages to scrape (default: 1)"
